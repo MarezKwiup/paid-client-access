@@ -5,6 +5,7 @@ import { pinoHttp } from 'pino-http';
 import { env } from './config/env.js';
 import { logger } from './lib/logger.js';
 import { errorHandler, notFound } from './lib/errors.js';
+import { apiRouter } from './routes/index.js';
 
 export function createApp() {
     const app = express();
@@ -20,6 +21,8 @@ export function createApp() {
     app.get('/health', (_req, res) => {
         res.json({ ok: true });
     });
+
+    app.use('/api', apiRouter);
 
     app.use(notFound);
     app.use(errorHandler);
