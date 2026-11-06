@@ -6,6 +6,7 @@ import { env } from './config/env.js';
 import { logger } from './lib/logger.js';
 import { errorHandler, notFound } from './lib/errors.js';
 import { apiRouter } from './routes/index.js';
+import { webhookRouter } from './routes/webhook.js';
 
 export function createApp() {
     const app = express();
@@ -15,7 +16,7 @@ export function createApp() {
     app.use(cors({ origin: env.WEB_ORIGIN }));
 
     // Stripe webhook mounts here because signature verification requires raw request body.
-
+    app.use('/api/webhook', webhookRouter);
     app.use(express.json({ limit: '100kb' }));
 
     app.get('/health', (_req, res) => {
