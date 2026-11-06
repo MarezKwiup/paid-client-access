@@ -87,5 +87,35 @@ export async function syncPurchaseToZoho(purchaseId: string, log: Logger): Promi
 }
 
 export async function processDueSyncs(log: Logger, limit = 10) {
-    
+    const { data, error } = await supabaseAdmin
+        .from('crm_syncs')
+        .select('purchase_id')
+        .eq('status', 'pending')
+        .lte('next_attempt_at', new Date().toISOString())
+        .order('next_attempt_at', { ascending: true })
+        .limit(limit)
+    if (error) throw error;
+
+    const results: Record<SyncOutcome, number> = { synced: 0, retry_scheduled: 0, failed: 0, skipped: 0 };
+    for (const row of data) {
+        try {
+            results[await syncPurchaseToZoho(row.purchase_id, log)]++;
+        } catch (err) {
+            log.error({ err, purchaseId: row.purchase_id }, 'CRM sync attempt crashed');
+        }
+    }
+    return results;
+}
+
+// Move failed rows back to pending.
+export async function requeueFailedSync(purchaseId: string): Promise<boolean> {
+    const { data, error } = await supabaseAdmin
+        .from('crm_syncs')
+        .update({ status: 'pending', next_attempt_at: new Date().toISOString() })
+        .eq('purchase_id', purchaseId)
+        .eq('status', 'failed')
+        .maybeSingle()
+
+    if (error) throw error;
+    return data !== null;
 }
