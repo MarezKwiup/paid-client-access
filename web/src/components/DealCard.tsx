@@ -20,7 +20,8 @@ export function DealCard({ item, onError }: { item: PortalItem; onError: (msg: s
     const [busy, setBusy] = useState<'buy' | 'download' | null>(null);
     const { document: doc, hasAccess, latestPurchase: p } = item;
     const paidButNotUnlocked = !hasAccess && p?.status === 'paid';
-    const crm = p?.status === 'paid' && p.crm_sync ? CRM_LABEL[p.crm_sync.status] : null;
+    const showCrm = p?.status === 'paid' || p?.status === 'refunded';
+    const crm = showCrm && p?.crm_sync ? CRM_LABEL[p.crm_sync.status] : null;
 
     async function buy() {
         setBusy('buy');

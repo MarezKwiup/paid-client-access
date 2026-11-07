@@ -11,6 +11,7 @@ const DEAL_FIELDS = {
     stripePaymentId: 'Stripe_Payment_ID',
 } as const;
 const PAID_STAGE = 'Closed Won';
+const REFUNDED_STAGE = 'Closed Lost';
 
 export class ZohoError extends Error {
     constructor(
@@ -113,30 +114,34 @@ export async function markDealPaid(input: {
     zohoDealId: string;
     stripePaymentId: string;
     paidAt: Date;
-}): Promise<void> {
-    const json = await zohoRequest(`/Deals/${encodeURIComponent(input.zohoDealId)}`, {
+}) {
+    return updateDeal(input.zohoDealId, {
+        [DEAL_FIELDS.stage]: PAID_STAGE,
+        [DEAL_FIELDS.closingDate]: input.paidAt.toISOString().slice(0, 10),
+        [DEAL_FIELDS.stripePaymentId]: input.stripePaymentId
+    });
+}
+
+async function updateDeal(zohoDealId: string, fields: Record<string, string>): Promise<void> {
+    const json = await zohoRequest(`/Deals/${encodeURIComponent(zohoDealId)}`, {
         method: 'PUT',
-        body: JSON.stringify({
-            data: [
-                {
-                    [DEAL_FIELDS.stage]: PAID_STAGE,
-                    [DEAL_FIELDS.closingDate]: input.paidAt.toISOString().slice(0, 10),
-                    [DEAL_FIELDS.stripePaymentId]: input.stripePaymentId,
-                },
-            ],
-        }),
+        body: JSON.stringify({ data: [fields] }),
     });
 
-    // Zoho reports per-record results. A record-level error (deleted Deal,
-    // invalid field) won't fix itself, so it's not retriable.
     const record = json.data?.[0];
     if (record?.status !== 'success') {
         throw new ZohoError(
-            `Zoho rejected update: ${record?.code ?? 'unknown'} ${record?.message ?? ''}`.trim(),
+            `Zoho rejected update: ${record?.code ?? 'unkown'} ${record?.message ?? ''}`.trim(),
             false,
             undefined,
             record?.code
         );
     }
+}
+
+export function markDealRefunded(input: { zohoDealId: string }) {
+    return updateDeal(input.zohoDealId, {
+        [DEAL_FIELDS.stage]: REFUNDED_STAGE
+    });
 }
 

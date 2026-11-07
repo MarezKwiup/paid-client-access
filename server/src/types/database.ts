@@ -65,6 +65,7 @@ export type Database = {
       }
       crm_syncs: {
         Row: {
+          action: string
           attempts: number
           created_at: string
           last_error: string | null
@@ -75,6 +76,7 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          action?: string
           attempts?: number
           created_at?: string
           last_error?: string | null
@@ -85,6 +87,7 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          action?: string
           attempts?: number
           created_at?: string
           last_error?: string | null
@@ -232,6 +235,7 @@ export type Database = {
           document_id: string
           id: string
           paid_at: string | null
+          refunded_at: string | null
           status: string
           stripe_checkout_session_id: string | null
           stripe_payment_intent_id: string | null
@@ -246,6 +250,7 @@ export type Database = {
           document_id: string
           id?: string
           paid_at?: string | null
+          refunded_at?: string | null
           status?: string
           stripe_checkout_session_id?: string | null
           stripe_payment_intent_id?: string | null
@@ -260,6 +265,7 @@ export type Database = {
           document_id?: string
           id?: string
           paid_at?: string | null
+          refunded_at?: string | null
           status?: string
           stripe_checkout_session_id?: string | null
           stripe_payment_intent_id?: string | null
@@ -324,6 +330,15 @@ export type Database = {
           p_payment_intent_id: string
           p_purchase_id: string
           p_session_id: string
+        }
+        Returns: Json
+      }
+      refund_purchase: {
+        Args: {
+          p_event_id: string
+          p_event_type: string
+          p_payment_intent_id: string
+          p_purchase_id: string
         }
         Returns: Json
       }

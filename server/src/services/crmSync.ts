@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 import { supabaseAdmin } from "../lib/clients.js";
-import { markDealPaid, ZohoError } from "../integrations/zoho.js";
+import { markDealPaid, ZohoError, markDealRefunded } from "../integrations/zoho.js";
 
 const MAX_ATTEMPTS = 8;
 const LEASE_MS = 2 * 60 * 1000;
@@ -17,20 +17,21 @@ export type SyncOutcome = 'synced' | 'retry_scheduled' | 'failed' | 'skipped';
 export async function syncPurchaseToZoho(purchaseId: string, log: Logger): Promise<SyncOutcome> {
     const now = new Date();
 
-    // 1. Claim a lease, with conditional update, to maintain race conditions with simulataneous claims
+    // 1. Claim a lease with one conditional UPDATE, so simultaneous callers can't both run this sync.
     const { data: claimed, error: claimErr } = await supabaseAdmin
         .from('crm_syncs')
         .update({ next_attempt_at: new Date(now.getTime() + LEASE_MS).toISOString() })
         .eq('purchase_id', purchaseId)
         .eq('status', 'pending')
         .lte('next_attempt_at', now.toISOString())
-        .select('attempts')
+        .select('attempts, action')
         .maybeSingle();
     if (claimErr) throw claimErr;
     if (!claimed) {
         log.debug({ purchaseId }, 'CRM sync not due or claimed elsewhere');
         return 'skipped';
     }
+    const { action } = claimed;
     const attempts = claimed.attempts + 1;
 
     // Load data for zoho update
@@ -44,14 +45,20 @@ export async function syncPurchaseToZoho(purchaseId: string, log: Logger): Promi
     // Call zoho
     let failure: unknown = null;
     try {
-        if (!purchase.deal || !purchase.stripe_payment_intent_id) {
-            throw new ZohoError('Purchase is missing its deal or payment intent', false);
+        if (!purchase.deal) throw new ZohoError('Purchase has no linked deal', false);
+
+        if (action === 'mark_refunded') {
+            await markDealRefunded({ zohoDealId: purchase.deal.zoho_deal_id });
+        } else {
+            if (!purchase.stripe_payment_intent_id) {
+                throw new ZohoError('Paid purchase has no payment intent', false);
+            }
+            await markDealPaid({
+                zohoDealId: purchase.deal.zoho_deal_id,
+                stripePaymentId: purchase.stripe_payment_intent_id,
+                paidAt: new Date(purchase.paid_at ?? Date.now()),
+            });
         }
-        await markDealPaid({
-            zohoDealId: purchase.deal.zoho_deal_id,
-            stripePaymentId: purchase.stripe_payment_intent_id,
-            paidAt: new Date(purchase.paid_at ?? Date.now()),
-        });
     } catch (err) {
         failure = err;
     }
@@ -60,9 +67,12 @@ export async function syncPurchaseToZoho(purchaseId: string, log: Logger): Promi
         const { error } = await supabaseAdmin
             .from('crm_syncs')
             .update({ status: 'synced', attempts, synced_at: new Date().toISOString(), last_error: null })
-            .eq('purchase_id', purchaseId);
+            .eq('purchase_id', purchaseId)
+            .eq('action', action);
         if (error) throw error;
-        log.info({ purchaseId, attempts }, 'Zoho Deal mark paid');
+        log.info({ purchaseId, action, attempts }, 
+            action === 'mark_refunded' ? 'Zoho Deal marked refunded' : 'Zoho Deal marked paid',
+        );
         return 'synced';
     }
 
@@ -79,10 +89,11 @@ export async function syncPurchaseToZoho(purchaseId: string, log: Logger): Promi
             last_error: message,
             next_attempt_at: new Date(Date.now() + (giveUp ? 0 : backoffMs(attempts))).toISOString(),
         })
-        .eq('purchase_id', purchaseId);
+        .eq('purchase_id', purchaseId)
+        .eq('action', action);
     if (error) throw error;
 
-    log.warn({ purchaseId, attempts, retriable, giveUp, err: message }, 'Zoho sync failed');
+    log.warn({ purchaseId, action, attempts, retriable, giveUp, err: message }, 'Zoho sync failed');
     return giveUp ? 'failed' : 'retry_scheduled';
 }
 

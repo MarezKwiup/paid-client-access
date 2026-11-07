@@ -14,7 +14,14 @@ type FulfilResult = {
     crm_sync_status: 'pending' | 'synced' | 'failed' | null;
 };
 
-const UNMATCHABLE = ['purchase_not_found', 'session_mismatch', 'amount_mismatch'];
+type RefundResult = {
+    purchase_id: string;
+    newly_refunded: boolean;
+    access_revoked: boolean;
+    crm_sync_status: 'pending' | 'synced' | 'failed' | null;
+};
+
+const UNMATCHABLE = ['purchase_not_found', 'session_mismatch', 'amount_mismatch', 'payment_intent_mismatch'];
 
 export const webhookRouter = Router();
 
@@ -63,6 +70,9 @@ webhookRouter.post('/', express.raw({ type: 'application/json' }), async (req, r
             await retirePurchase(event, event.data.object, log);
             break;
         
+        case 'charge.refunded' :
+            purchaseToSync = await handleRefund(event, event.data.object, log);
+            break;
         default:
             log.info('Event type not handled, acknowledging');
             await recordEvent(event);
@@ -155,4 +165,67 @@ async function retirePurchase(event: Stripe.Event, session: Stripe.Checkout.Sess
         log.info({ purchaseId }, 'Pending purchase retired');
     }
     await recordEvent(event);
+}
+
+async function handleRefund(event: Stripe.Event, charge: Stripe.Charge, log: Logger): Promise<string | null> {
+    const paymentIntentId =
+        typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
+    if (!paymentIntentId) {
+        log.warn('Refunded charge has not payment intent, ignoring');
+        await recordEvent(event);
+        return null;
+    }
+
+    if (!charge.refunded) {
+        log.info(
+            { paymentIntentId, amountRefunded: charge.amount_refunded, amount: charge.amount },
+            'Partial refund, access kept',
+        );
+        await recordEvent(event);
+        return null;
+    }
+
+    const purchaseId = await resolvePurchaseIdForRefund(paymentIntentId);
+    if (!purchaseId) {
+        log.error({ paymentIntentId }, 'Refund could not be matched to a purchase');
+        await recordEvent(event);
+        return null;
+    }
+
+    const { data, error } = await supabaseAdmin.rpc('refund_purchase', {
+        p_purchase_id: purchaseId,
+        p_payment_intent_id: paymentIntentId,
+        p_event_id: event.id,
+        p_event_type: event.type
+    });
+
+    if (error) {
+        if (UNMATCHABLE.some((code) => error.message.startsWith(code))) {
+            log.error({ err: error, purchaseId }, 'Refund could not be applied');
+            await recordEvent(event);
+            return null;
+        }
+        throw error;
+    }
+
+    const result = data as unknown as RefundResult;
+    log.info(
+        { purchaseId, newlyRefunded: result.newly_refunded, accessRevoked: result.access_revoked, crm: result.crm_sync_status },
+        'Purchase refunded',
+    );
+    return result.crm_sync_status === 'pending' ? purchaseId : null;
+}
+
+async function resolvePurchaseIdForRefund(paymentIntentId: string): Promise<string | null> {
+    const { data, error } = await supabaseAdmin
+        .from('purchases')
+        .select('id')
+        .eq('stripe_payment_intent_id', paymentIntentId)
+        .maybeSingle();
+    if (error) throw error;
+    if (data) return data.id;
+
+    const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    const parsed = z.string().uuid().safeParse(intent.metadata?.purchase_id);
+    return parsed.success ? parsed.data : null;
 }
