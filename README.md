@@ -22,6 +22,8 @@ A small client portal where a signed-in client pays for a document with Stripe, 
 | Portal shows access and CRM sync status, read from Supabase | ✅ Reads go directly to Supabase under RLS |
 | One client cannot read another client's document or purchase | ✅ RLS on every table, private bucket, server-side entitlement check |
 | No credentials in the repo | ✅ `.env.example` only; server refuses to boot with live Stripe keys |
+| **Extra:** refunds | ✅ Full refund revokes access and moves the Deal to `Closed Lost`; partial refunds keep access |
+| **Extra:** automated tests | ✅ 30 offline tests (Vitest + Supertest) with real Stripe signatures |
 
 ---
 
@@ -154,14 +156,27 @@ The Zoho update itself is idempotent: it sets fixed values, so repeating it is h
 - Session creation uses a Stripe **idempotency key** per purchase.
 - A retired `expired` purchase can still become `paid`, so a payment that lands at the exact moment a session is retired is honoured, not lost.
 
-### 7. Webhook responses
+### 7. Refunds
+
+`charge.refunded` is handled by a second Postgres function, `refund_purchase`, with the same row lock and the same in-transaction event log as `fulfil_purchase`.
+
+- **Matched by PaymentIntent id**, which is stored as a unique column on `purchases`. This is the same stable-ID principle as checkout.
+- **Full refunds only revoke access.** Stripe's `charge.refunded` flag is `true` only once the charge is fully refunded. Whether a partial refund should revoke access is a business decision; this project keeps access and logs it.
+- **Revoke, don't delete.** `entitlements.revoked_at` is set and `purchases.status` becomes `refunded`, so the audit trail stays intact. Buying again reactivates the same entitlement row.
+- **Out-of-order delivery.** Stripe doesn't guarantee event order. If a refund arrives before `checkout.session.completed`, the purchase has no PaymentIntent id yet, so the server falls back to the `purchase_id` copied onto the PaymentIntent's metadata at checkout. The purchase becomes `refunded`, and the late `completed` event is a no-op, so access is never granted.
+- **The CRM update reuses the retry machinery.** The existing `crm_syncs` row is switched to `action = 'mark_refunded'` and `pending`. Two guards stop an in-flight "mark paid" call from landing *after* the refund and leaving the Deal at Closed Won:
+  - the refund never cuts into an active lease (`next_attempt_at = greatest(next_attempt_at, now())`);
+  - every result write is conditional on `action` matching what was attempted, so a stale "paid" result becomes a no-op.
+
+### 8. Webhook responses
 
 | Situation | Response | Why |
 |---|---|---|
 | Bad or missing signature | `400` | Not from Stripe |
 | Transient failure (DB unreachable) | `500` | Stripe redelivers, which is what we want |
-| Unmatchable payment (unknown purchase, amount mismatch) | `200` + error log | Retrying for 3 days cannot fix it; grant nothing and flag for manual review |
+| Unmatchable payment or refund (unknown purchase, amount or PaymentIntent mismatch) | `200` + error log | Retrying for 3 days cannot fix it; grant nothing and flag for manual review |
 | Already processed | `200` `{ duplicate: true }` | Idempotent |
+| Partial refund | `200` + info log | Business rule: access kept |
 
 ---
 
@@ -170,23 +185,24 @@ The Zoho update itself is idempotent: it sets fixed values, so repeating it is h
 ```
 paid-client-access/
 ├── server/
-│   └── src/
-│       ├── config/env.ts          zod-validated env, refuses live Stripe keys
-│       ├── lib/                   Stripe + Supabase clients, pino logger, errors
-│       ├── middleware/            Bearer-token auth, admin key (constant-time compare)
-│       ├── integrations/zoho.ts   OAuth token cache + Deal update
-│       ├── services/crmSync.ts    lease, backoff, retry logic
-│       ├── routes/                checkout, webhook, documents, admin
-│       ├── workers/               CRM retry worker
-│       ├── scripts/retry-crm.ts   manual retry command
-│       └── types/                 generated database types
+│   ├── src/
+│   │   ├── config/env.ts          zod-validated env, refuses live Stripe keys
+│   │   ├── lib/                   Stripe + Supabase clients, pino logger, errors
+│   │   ├── middleware/            Bearer-token auth, admin key (constant-time compare)
+│   │   ├── integrations/zoho.ts   OAuth token cache + Deal update
+│   │   ├── services/crmSync.ts    lease, backoff, retry logic
+│   │   ├── routes/                checkout, webhook, documents, admin
+│   │   ├── workers/               CRM retry worker
+│   │   ├── scripts/retry-crm.ts   manual retry command
+│   │   └── types/                 generated database types
+│   └── tests/                     webhook, Zoho client, auth + isolation
 ├── web/
 │   └── src/
 │       ├── lib/                   env guard, Supabase client, API client
 │       ├── hooks/                 session, portal data
 │       └── components/            login, portal, deal card
 └── supabase/
-    ├── migrations/                schema, RLS, fulfil_purchase, storage, constraints
+    ├── migrations/                schema, RLS, fulfil_purchase, storage, constraints, refunds
     └── seed.sql                   2 clients, 1 document, 2 deals
 ```
 
@@ -263,6 +279,7 @@ cp web/.env.example web/.env
 | Variable | Description |
 |---|---|
 | `PORT` | Default `4000` |
+| `LOG_LEVEL` | `info` by default; `debug` for more detail, `silent` in tests |
 | `WEB_ORIGIN` | `http://localhost:5173`, used for CORS and Stripe redirect URLs |
 | `SUPABASE_URL` | Project URL |
 | `SUPABASE_SECRET_KEY` | `sb_secret_…`, **server only**, bypasses RLS |
@@ -304,7 +321,27 @@ Open **http://localhost:5173** and sign in as Client A.
 
 ---
 
-## Testing a purchase
+## Automated tests
+
+```bash
+cd server
+npm test            # 30 tests, about 1 second, fully offline
+npm run typecheck   # app + tests
+```
+
+Tests use fake environment values (`tests/setup.ts`), so they never touch real accounts.
+
+| File | Covers |
+|---|---|
+| `webhook.test.ts` | Signature checks with real Stripe signatures; fulfilment arguments; duplicate events; already-paid redelivery; unpaid async sessions; missing metadata; unmatchable payment → 200; transient DB error → 500; Zoho crash doesn't affect the Stripe response; full, partial, and out-of-order refunds |
+| `zoho.test.ts` | Token caching; one shared in-flight refresh for concurrent calls; Zoho's HTTP-200-with-`error` quirk; 401 → refresh and retry once; 429 and network errors retriable; record-level errors permanent; refund update; backoff bounds |
+| `routes.test.ts` | Missing and invalid tokens; body validation; client B cannot buy A's deal (and the query is filtered by B's verified id); already-owned purchase refused; download denied without an entitlement; admin key checks |
+
+The SQL functions (`fulfil_purchase`, `refund_purchase`) were verified manually against the database (see the walkthrough below); automated database tests are listed under next steps.
+
+---
+
+## Testing a purchase manually
 
 1. Sign in as Client A. The card shows **Locked** / **Not purchased**.
 2. Click **Buy** and pay with `4242 4242 4242 4242`, any future expiry, any CVC.
@@ -327,6 +364,22 @@ The server logs `Duplicate event, already processed`; there is no second entitle
 1. Change one character of `ZOHO_REFRESH_TOKEN` in `server/.env` and restart the server.
 2. Buy as Client B. Access is granted immediately; CRM shows **Syncing…**, and `crm_syncs` holds `pending`, `attempts = 1`, and the error.
 3. Restore the token and restart. The worker syncs it on its next tick and the portal shows **Recorded**.
+
+### Refunds
+
+Get Client A's PaymentIntent id:
+```sql
+select p.stripe_payment_intent_id
+from public.purchases p
+join public.clients c on c.id = p.client_id
+where c.email = 'client-a@test.com' and p.status = 'paid';
+```
+Then:
+```bash
+stripe refunds create --payment-intent=<pi_id> --amount=10000   # partial: access kept
+stripe refunds create --payment-intent=<pi_id>                  # remaining amount: access revoked
+```
+After the full refund, reload the portal: Client A's card shows **Locked**, **Payment: Refunded**, and the Zoho Deal Stage is **Closed Lost**. The download route returns `403`. Buying again unlocks the document and moves the Deal back to Closed Won.
 
 ### Manual retry
 
@@ -376,6 +429,11 @@ curl -s "$SUPABASE_URL/rest/v1/crm_syncs?select=last_error" \
 | Someone visits `?checkout=success` by hand | Only starts polling; nothing unlocks without a real entitlement |
 | Async payment methods | `completed` with `payment_status: unpaid` is ignored; `async_payment_succeeded` fulfils |
 | Checkout abandoned | `checkout.session.expired` retires the pending purchase |
+| Full refund | Access revoked, purchase `refunded`, Deal moved to `Closed Lost` through the same retry path |
+| Partial refund | Access kept (business rule), logged |
+| Refund arrives before checkout completion | Matched through PaymentIntent metadata; late `completed` event is a no-op |
+| Refund while a "mark paid" Zoho call is in flight | Lease respected and result writes conditional on `action`, so the Deal ends at Closed Lost |
+| Re-buying after a refund | Same entitlement row reactivated; new purchase gets its own CRM sync |
 | Amount or currency tampered, or wrong environment | `fulfil_purchase` raises; nothing is granted; logged for review |
 | Live Stripe key configured by mistake | Server refuses to start |
 | Secret Supabase key put in the frontend | Web app refuses to start |
@@ -396,9 +454,11 @@ curl -s "$SUPABASE_URL/rest/v1/crm_syncs?select=last_error" \
 
 ## Known limitations and what I'd do next
 
-- **Refunds.** The schema and metadata are ready (`purchases.status = 'refunded'`, `entitlements.revoked_at`, and `purchase_id` on the PaymentIntent metadata), but `charge.refunded` is currently only acknowledged. Next step: map it to the purchase, revoke the entitlement and mark the purchase refunded in one transaction, and queue a CRM update to move the Deal out of Closed Won. Partial refunds need a business decision.
-- **Automated tests.** Next: Vitest + Supertest for the webhook using `stripe.webhooks.generateTestHeaderString` (bad signature, duplicate event, concurrent delivery, Zoho mocked down), plus tests for `fulfil_purchase` against a local Supabase stack.
+- **Database tests.** `fulfil_purchase` and `refund_purchase` were verified by hand. Next: pgTAP tests run with `supabase test db` against a local Docker stack, covering concurrent fulfilment, the expired → paid path, refund-before-completion, and RLS policies per role.
+- **Partial refunds.** Currently access is kept. The rule (keep, revoke, or revoke past a threshold) should come from the business, and the CRM would ideally record the refunded amount.
+- **A dedicated refund stage in Zoho.** Refunds currently move the Deal to `Closed Lost`; a custom "Refunded" stage would be clearer for the sales team.
+- **Live updates.** The portal polls for about 40 seconds after checkout and otherwise refreshes on demand. Supabase Realtime would push entitlement and sync changes instead.
 - **Client provisioning.** `clients` rows are seeded by hand. In production a trigger on `auth.users` (or an onboarding flow) would create them and link the Zoho Contact.
 - **Alerting.** `failed` syncs and unmatchable payments are logged; in production they'd go to an alerting channel or an ops dashboard.
-- **Deployment.** Docker image for the server, CI running typecheck + tests, and a registered Stripe webhook endpoint (with its own secret) instead of the CLI tunnel.
+- **Deployment.** Docker image for the server, CI running typecheck + tests on every push, and a registered Stripe webhook endpoint (with its own secret) instead of the CLI tunnel.
 - **Zoho token storage.** The refresh token lives in an env var. In production it would live in a secrets manager, with rotation.
