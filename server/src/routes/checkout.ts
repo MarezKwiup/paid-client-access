@@ -39,7 +39,7 @@ checkoutRouter.post('/', requireAuth, async (req, res) => {
         .maybeSingle();
     if (ownedErr) throw ownedErr;
     if (owned) {
-        throw new AppError(409, 'already owned', 'You already have access to this document');
+        throw new AppError(409, 'already_owned', 'You already have access to this document');
     }
 
     const { data: pending, error: pendingErr } = await supabaseAdmin
